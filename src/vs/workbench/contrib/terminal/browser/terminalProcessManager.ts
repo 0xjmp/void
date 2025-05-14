@@ -4,7 +4,7 @@
  *--------------------------------------------------------------------------------------------*/
 
 import { Emitter, Event } from '../../../../base/common/event.js';
-import { Disposable, dispose, IDisposable, toDisposable } from '../../../../base/common/lifecycle.js';
+import { DisposableStore, Disposable, dispose, IDisposable, toDisposable } from '../../../../base/common/lifecycle.js';
 import { Schemas } from '../../../../base/common/network.js';
 import { IProcessEnvironment, isMacintosh, isWindows, OperatingSystem, OS } from '../../../../base/common/platform.js';
 import { URI } from '../../../../base/common/uri.js';
@@ -199,6 +199,20 @@ export class TerminalProcessManager extends Disposable implements ITerminalProce
 
 	override dispose(immediate: boolean = false): void {
 		this._isDisposed = true;
+		// Dispose all process-related listeners
+		if (this._processListeners) {
+			for (const listener of this._processListeners) {
+				listener.dispose();
+			}
+			this._processListeners = undefined;
+		}
+		// Clean up PTY listeners
+		if (this._ptyListenersAttached) {
+			this._ptyResponsiveListener?.dispose();
+			this._ptyResponsiveListener = undefined;
+			this._ptyListenersAttached = false;
+		}
+		// Also dispose the process itself
 		if (this._process) {
 			// If the process was still connected this dispose came from
 			// within VS Code, not the process, so mark the process as
@@ -207,6 +221,8 @@ export class TerminalProcessManager extends Disposable implements ITerminalProce
 			this._process.shutdown(immediate);
 			this._process = null;
 		}
+		// Ensure data filter is disposed
+		this._dataFilter.dispose();
 		super.dispose();
 	}
 
@@ -354,41 +370,53 @@ export class TerminalProcessManager extends Disposable implements ITerminalProce
 
 		this._dataFilter.newProcess(this._process, reset);
 
-		if (this._processListeners) {
-			dispose(this._processListeners);
-		}
-		this._processListeners = [
-			newProcess.onProcessReady((e: IProcessReadyEvent) => {
-				this._processTraits = e;
-				this.shellProcessId = e.pid;
-				this._initialCwd = e.cwd;
-				this._onDidChangeProperty.fire({ type: ProcessPropertyType.InitialCwd, value: this._initialCwd });
-				this._onProcessReady.fire(e);
+        // Properly dispose of old listeners
+        if (this._processListeners) {
+            dispose(this._processListeners);
+            this._processListeners = undefined;
+        }
 
-				if (this._preLaunchInputQueue.length > 0 && this._process) {
-					// Send any queued data that's waiting
-					newProcess.input(this._preLaunchInputQueue.join(''));
-					this._preLaunchInputQueue.length = 0;
-				}
-			}),
-			newProcess.onProcessExit(exitCode => this._onExit(exitCode)),
-			newProcess.onDidChangeProperty(({ type, value }) => {
-				switch (type) {
-					case ProcessPropertyType.HasChildProcesses:
-						this._hasChildProcesses = value;
-						break;
-					case ProcessPropertyType.FailedShellIntegrationActivation:
-						this._telemetryService?.publicLog2<{}, { owner: 'meganrogge'; comment: 'Indicates shell integration was not activated because of custom args' }>('terminal/shellIntegrationActivationFailureCustomArgs');
-						break;
-				}
-				this._onDidChangeProperty.fire({ type, value });
-			})
-		];
+        // Create new listeners
+        const listeners = new DisposableStore();
+        this._processListeners = [listeners];
+
+		// Process ready handler
+		listeners.add(newProcess.onProcessReady((e: IProcessReadyEvent) => {
+			this._processTraits = e;
+			this.shellProcessId = e.pid;
+			this._initialCwd = e.cwd;
+			this._onDidChangeProperty.fire({ type: ProcessPropertyType.InitialCwd, value: this._initialCwd });
+			this._onProcessReady.fire(e);
+
+			if (this._preLaunchInputQueue.length > 0 && this._process) {
+				// Send any queued data that's waiting
+				newProcess.input(this._preLaunchInputQueue.join(''));
+				this._preLaunchInputQueue.length = 0;
+			}
+		}));
+
+		// Process exit handler
+		listeners.add(newProcess.onProcessExit(exitCode => this._onExit(exitCode)));
+
+		// Property change handler
+		listeners.add(newProcess.onDidChangeProperty(({ type, value }) => {
+			switch (type) {
+				case ProcessPropertyType.HasChildProcesses:
+					this._hasChildProcesses = value;
+					break;
+				case ProcessPropertyType.FailedShellIntegrationActivation:
+					this._telemetryService?.publicLog2<{}, { owner: 'meganrogge'; comment: 'Indicates shell integration was not activated because of custom args' }>('terminal/shellIntegrationActivationFailureCustomArgs');
+					break;
+			}
+			this._onDidChangeProperty.fire({ type, value });
+		}));
+
+		// Optional process handlers
 		if (newProcess.onProcessReplayComplete) {
-			this._processListeners.push(newProcess.onProcessReplayComplete(() => this._onProcessReplayComplete.fire()));
+			listeners.add(newProcess.onProcessReplayComplete(() => this._onProcessReplayComplete.fire()));
 		}
 		if (newProcess.onRestoreCommands) {
-			this._processListeners.push(newProcess.onRestoreCommands(e => this._onRestoreCommands.fire(e)));
+			listeners.add(newProcess.onRestoreCommands(e => this._onRestoreCommands.fire(e)));
 		}
 		setTimeout(() => {
 			if (this.processState === ProcessState.Launching) {

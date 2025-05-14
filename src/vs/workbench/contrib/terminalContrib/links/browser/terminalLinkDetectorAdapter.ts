@@ -28,12 +28,23 @@ export interface IShowHoverEvent {
  * Wrap a link detector object so it can be used in xterm.js
  */
 export class TerminalLinkDetectorAdapter extends Disposable implements ILinkProvider {
-	private _activeLinks: TerminalLink[] | undefined;
+	private _currentLinks: Map<number, TerminalLink[]> = new Map();
 
 	private readonly _onDidActivateLink = this._register(new Emitter<IActivateLinkEvent>());
 	readonly onDidActivateLink = this._onDidActivateLink.event;
 	private readonly _onDidShowHover = this._register(new Emitter<IShowHoverEvent>());
 	readonly onDidShowHover = this._onDidShowHover.event;
+
+	override dispose(): void {
+		super.dispose();
+		// Clean up all links
+		for (const links of this._currentLinks.values()) {
+			for (const link of links) {
+				link.dispose();
+			}
+		}
+		this._currentLinks.clear();
+	}
 
 	constructor(
 		private readonly _detector: ITerminalLinkDetector,
@@ -44,22 +55,38 @@ export class TerminalLinkDetectorAdapter extends Disposable implements ILinkProv
 
 	private _activeProvideLinkRequests: Map<number, Promise<TerminalLink[]>> = new Map();
 	async provideLinks(bufferLineNumber: number, callback: (links: ILink[] | undefined) => void) {
-		let activeRequest = this._activeProvideLinkRequests.get(bufferLineNumber);
-		if (activeRequest) {
-			await activeRequest;
-			callback(this._activeLinks);
+		// Return cached links if available
+		const existingLinks = this._currentLinks.get(bufferLineNumber);
+		if (existingLinks) {
+			callback(existingLinks);
 			return;
 		}
-		if (this._activeLinks) {
-			for (const link of this._activeLinks) {
+
+		// Wait for existing request if there is one
+		let activeRequest = this._activeProvideLinkRequests.get(bufferLineNumber);
+		if (activeRequest) {
+			const links = await activeRequest;
+			callback(links);
+			return;
+		}
+
+		// Create new request
+		activeRequest = this._provideLinks(bufferLineNumber);
+		this._activeProvideLinkRequests.set(bufferLineNumber, activeRequest);
+		const links = await activeRequest;
+		this._activeProvideLinkRequests.delete(bufferLineNumber);
+
+		// Clean up old links for this line if they exist
+		const oldLinks = this._currentLinks.get(bufferLineNumber);
+		if (oldLinks) {
+			for (const link of oldLinks) {
 				link.dispose();
 			}
 		}
-		activeRequest = this._provideLinks(bufferLineNumber);
-		this._activeProvideLinkRequests.set(bufferLineNumber, activeRequest);
-		this._activeLinks = await activeRequest;
-		this._activeProvideLinkRequests.delete(bufferLineNumber);
-		callback(this._activeLinks);
+
+		// Store and return new links
+		this._currentLinks.set(bufferLineNumber, links);
+		callback(links);
 	}
 
 	private async _provideLinks(bufferLineNumber: number): Promise<TerminalLink[]> {
